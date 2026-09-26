@@ -21,7 +21,19 @@ python3 app.py --db airline_recovery.db
 - `POST /api/plans/{id}/validate`、`/lock`：校验并原子锁定方案。
 - `GET /api/disruptions/{id}/compare`：比较恢复方案成本。
 - `POST /api/flights/{id}/cancel`、`/recover`：取消和人工恢复。
+- `POST /api/rolling/preview`：恢复滚动预览。以一趟航班为起点，沿同一架飞机后续航段顺延或保留取消，逐段核对维护、执勤、宵禁和航线许可，冲突写清航班号和约束；预览落库为调整记录。
+- `POST /api/rolling/{id}/confirm`：确认后写入执行方案，只改预览涉及的航段，其他航班保持原样；有冲突或预览后航班版本已变会被拒绝。
+- `GET /api/rolling`、`/api/rolling/{id}`：查询滚动调整记录。
 - `GET /api/state`、`GET /api/plans/{id}`：查询状态和影响。
+- `GET /rolling`：恢复滚动台页面入口。
+
+## 文件结构
+
+- `app.py`：HTTP 服务、恢复方案与既有校验。
+- `common.py`：共享错误类型与时间工具。
+- `rolling.py`：恢复滚动计算（顺延/保留取消、逐段约束核对），只读不写。
+- `adjustments.py`：滚动调整记录（预览落库、确认写入执行方案、历史查询）。
+- `static/rolling.html`：恢复滚动台页面入口。
 
 ## 测试
 

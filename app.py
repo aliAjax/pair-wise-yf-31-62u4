@@ -7,49 +7,17 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, time, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import adjustments
+import rolling
+from common import ApiError, iso, overlaps, parse_clock, parse_time, utcnow
+
 PORT = 8202
 ROLES = {"viewer", "scheduler", "ops_manager", "auditor"}
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str, details: Any = None):
-        super().__init__(message)
-        self.status, self.code, self.message, self.details = status, code, message, details
-
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def iso(value: datetime | None = None) -> str:
-    return (value or utcnow()).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def parse_time(value: str | None) -> datetime:
-    if not value:
-        raise ApiError(400, "time_required", "必须提供 ISO 8601 时间")
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ApiError(400, "invalid_time", f"时间格式错误: {value}") from exc
-    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
-
-
-def parse_clock(value: str) -> time:
-    try:
-        return time.fromisoformat(value)
-    except ValueError as exc:
-        raise ApiError(400, "invalid_clock", f"时刻格式应为 HH:MM: {value}") from exc
-
-
-def overlaps(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
-    return a_start < b_end and b_start < a_end
 
 
 class Repository:
@@ -98,6 +66,7 @@ class Repository:
             CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
             """
         )
+        adjustments.ensure_schema(self.conn)
 
     @staticmethod
     def audit(conn: sqlite3.Connection, plan_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -382,6 +351,39 @@ class AirlineRecoveryService:
             Repository.audit(conn, None, actor, role, "flight_recovered", {"flight_id": flight_id})
             return {"flight": dict(conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone())}
 
+    def preview_rolling(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "rolling_forbidden", "当前角色不能发起恢复滚动")
+        flight_id, action = body.get("flight_id"), str(body.get("action", "delay")).strip()
+        if not isinstance(flight_id, int) or action not in {"delay", "cancel"}:
+            raise ApiError(400, "invalid_rolling", "flight_id 必填,action 只能是 delay 或 cancel")
+        new_std = parse_time(body["new_std"]) if body.get("new_std") else None
+        new_sta = parse_time(body["new_sta"]) if body.get("new_sta") else None
+        reason = str(body.get("reason", "")).strip()
+        if action == "cancel" and not reason: raise ApiError(400, "reason_required", "取消原因必填")
+        with self.repo.tx() as conn:
+            result = rolling.compute_rolling(conn, flight_id, action=action, new_std=new_std, new_sta=new_sta,
+                                             aircraft_id=str(body.get("aircraft_id", "")).strip() or None,
+                                             crew_id=str(body.get("crew_id", "")).strip() or None, reason=reason)
+            record = adjustments.create_record(conn, flight_id=flight_id, action=action, actor=actor, result=result)
+            Repository.audit(conn, None, actor, role, "rolling_preview",
+                             {"record_id": record["id"], "flight_id": flight_id, "action": action, "conflicts": len(result["conflicts"])})
+            return {"record": record, "result": result}
+
+    def confirm_rolling(self, record_id: int, actor: str, role: str) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "rolling_forbidden", "当前角色不能确认恢复滚动")
+        with self.repo.tx() as conn:
+            outcome = adjustments.confirm_record(conn, record_id, actor)
+            if not outcome["idempotent"]:
+                Repository.audit(conn, None, actor, role, "rolling_confirmed",
+                                 {"record_id": record_id, "flights": [flight["flight_no"] for flight in outcome["flights"]]})
+            return outcome
+
+    def list_rolling(self) -> dict[str, Any]:
+        return {"records": adjustments.list_records(self.repo.conn)}
+
+    def get_rolling(self, record_id: int) -> dict[str, Any]:
+        return {"record": adjustments.get_record(self.repo.conn, record_id)}
+
     def get_plan(self, plan_id: int) -> dict[str, Any]:
         conn = self.repo.conn
         plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
@@ -433,7 +435,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health": return 200, {"status": "ok", "service": "airline-recovery"}
         actor, role = self.service.identity(self.headers)
         if path == "/api/state": return 200, self.service.state()
+        if path == "/api/rolling": return 200, self.service.list_rolling()
         parts = [p for p in path.split("/") if p]
+        if len(parts) == 3 and parts[:2] == ["api", "rolling"] and parts[2].isdigit(): return 200, self.service.get_rolling(int(parts[2]))
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["api", "disruptions"] and parts[2].isdigit() and parts[3] == "compare": return 200, self.service.compare_plans(int(parts[2]))
         raise ApiError(404, "not_found", "接口不存在")
@@ -447,8 +451,11 @@ class Handler(BaseHTTPRequestHandler):
             "/api/flights": lambda: (201, self.service.create_flight(actor, role, body)),
             "/api/disruptions": lambda: (201, self.service.create_disruption(actor, role, body)),
             "/api/recovery-plans": lambda: (201, self.service.create_plan(actor, role, body)),
+            "/api/rolling/preview": lambda: (201, self.service.preview_rolling(actor, role, body)),
         }
         if path in table: return table[path]()
+        if len(parts) == 4 and parts[:2] == ["api", "rolling"] and parts[2].isdigit() and parts[3] == "confirm":
+            return 200, self.service.confirm_rolling(int(parts[2]), actor, role)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit():
             plan_id, action = int(parts[2]), parts[3]
             if action == "assignments": return 200, self.service.add_assignment(plan_id, actor, role, body)
@@ -462,8 +469,9 @@ class Handler(BaseHTTPRequestHandler):
     def handle_request(self, method: str) -> None:
         parsed = urlparse(self.path)
         try:
-            if method == "GET" and parsed.path == "/":
-                raw = (self.web_root / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+            if method == "GET" and parsed.path in ("/", "/rolling"):
+                page = "index.html" if parsed.path == "/" else "rolling.html"
+                raw = (self.web_root / page).read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
             status, payload = self.get_api(parsed.path) if method == "GET" else self.post_api(parsed.path)
             respond(self, status, payload)
         except ApiError as exc:

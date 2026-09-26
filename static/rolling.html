@@ -1,0 +1,117 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>恢复滚动台</title>
+<style>
+body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef2f7;color:#182230;padding:0 20px}
+section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}
+input,select,button{font:inherit;padding:8px;margin:4px}
+button{background:#0f766e;color:white;border:0;border-radius:6px}
+button:disabled{background:#9ca3af}
+table{border-collapse:collapse;width:100%;margin:8px 0}
+td,th{border:1px solid #d7dee8;padding:6px 8px;text-align:left;font-size:14px}
+.conflict{color:#b91c1c}.ok{color:#047857}
+</style>
+<h1>恢复滚动台</h1>
+<p>调整一趟航班后,系统沿同一架飞机后续航段顺延或保留取消,逐段核对维护、执勤、宵禁和航线许可;确认后才写入执行方案,其他航班保持原样。<a href="/">返回控制台</a></p>
+
+<section>
+  身份 <input id="u" value="sched" size="8"> 角色 <input id="r" value="scheduler" size="12">
+  <button onclick="loadFlights()">载入航班</button>
+  <button onclick="loadRecords()">刷新调整记录</button>
+</section>
+
+<section>
+  <h2>1. 选择航班并调整</h2>
+  <select id="flightSel"></select>
+  <select id="actionSel">
+    <option value="delay">延误/调整时刻</option>
+    <option value="cancel">取消</option>
+  </select>
+  <span id="delayFields">
+    新起飞 <input id="newStd" type="datetime-local">
+    新到达 <input id="newSta" type="datetime-local">
+    换机 <input id="aircraftId" placeholder="飞机号(可选)" size="11">
+    换机组 <input id="crewId" placeholder="机组(可选)" size="9">
+  </span>
+  <input id="reasonInp" placeholder="原因(取消必填)" size="20">
+  <button onclick="preview()">滚动预览</button>
+</section>
+
+<section>
+  <h2>2. 滚动预览</h2>
+  <div id="previewBox">尚未预览</div>
+  <button id="confirmBtn" onclick="confirmRolling()" disabled>确认写入执行方案</button>
+</section>
+
+<section>
+  <h2>调整记录</h2>
+  <div id="recordsBox">暂无记录</div>
+</section>
+
+<script>
+let FL = [], current = null;
+const H = () => ({'Content-Type':'application/json','X-User-Id':u.value,'X-Role':r.value});
+const fmt = s => s ? s.replace('T',' ').replace('Z','') : '';
+const ACT = {adjusted:'调整',canceled:'取消',shifted:'顺延',kept:'保持原时刻',kept_canceled:'保留取消'};
+function toLocalInput(s){const d=new Date(s),p=n=>String(n).padStart(2,'0');return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`}
+async function api(path,opts){const x=await fetch(path,{headers:H(),...opts});const j=await x.json();if(!x.ok)throw new Error(j.message||x.status);return j}
+
+async function loadFlights(){
+  const s = await api('/api/state'); FL = s.flights;
+  flightSel.innerHTML = FL.map(f=>`<option value="${f.id}">${f.flight_no} ${f.origin}-${f.destination} ${fmt(f.std)}${f.status==='canceled'?'(已取消)':''}</option>`).join('');
+  prefill();
+}
+function prefill(){
+  const f = FL.find(x=>x.id===Number(flightSel.value));
+  if(f){newStd.value=toLocalInput(f.std);newSta.value=toLocalInput(f.sta)}
+}
+flightSel.onchange = prefill;
+actionSel.onchange = () => delayFields.style.display = actionSel.value==='delay' ? '' : 'none';
+
+async function preview(){
+  confirmBtn.disabled = true; current = null;
+  const body = {flight_id:Number(flightSel.value), action:actionSel.value, reason:reasonInp.value};
+  if(actionSel.value==='delay'){
+    if(!newStd.value||!newSta.value){previewBox.innerHTML='<p class="conflict">请填写新起飞和新到达时间</p>';return}
+    body.new_std = new Date(newStd.value).toISOString(); body.new_sta = new Date(newSta.value).toISOString();
+    if(aircraftId.value) body.aircraft_id = aircraftId.value;
+    if(crewId.value) body.crew_id = crewId.value;
+  }
+  try{
+    const j = await api('/api/rolling/preview',{method:'POST',body:JSON.stringify(body)});
+    current = j.record; renderPreview(j.result);
+    confirmBtn.disabled = !j.result.ok;
+  }catch(e){previewBox.innerHTML = `<p class="conflict">${e.message}</p>`}
+}
+
+function renderPreview(res){
+  let h = `<p>调整航班 <b>${res.adjustment.flight_no}</b>(${res.adjustment.action==='delay'?'延误':'取消'}),同机受影响航段 ${res.segments.length} 个。</p>`;
+  h += '<table><tr><th>航班号</th><th>航段</th><th>原时刻</th><th>新时刻</th><th>延误(分)</th><th>处理</th></tr>';
+  for(const s of res.segments)
+    h += `<tr><td>${s.flight_no}</td><td>${s.origin}-${s.destination}</td><td>${fmt(s.old_std)} → ${fmt(s.old_sta)}</td><td>${fmt(s.new_std)} → ${fmt(s.new_sta)}</td><td>${s.delay_minutes}</td><td>${ACT[s.action]||s.action}</td></tr>`;
+  h += '</table>';
+  if(res.conflicts.length){
+    h += '<p class="conflict">存在冲突,不能确认写入:</p><ul>';
+    for(const c of res.conflicts) h += `<li class="conflict">航班 ${c.flight_no} · 约束 ${c.constraint}:${c.message}</li>`;
+    h += '</ul>';
+  } else h += '<p class="ok">逐段核对通过,可以确认写入执行方案。</p>';
+  previewBox.innerHTML = h;
+}
+
+async function confirmRolling(){
+  if(!current) return;
+  try{
+    const j = await api(`/api/rolling/${current.id}/confirm`,{method:'POST',body:'{}'});
+    previewBox.innerHTML += `<p class="ok">已写入执行方案:${j.flights.map(f=>f.flight_no).join('、')}</p>`;
+    confirmBtn.disabled = true; loadFlights(); loadRecords();
+  }catch(e){previewBox.innerHTML += `<p class="conflict">确认失败:${e.message}</p>`}
+}
+
+async function loadRecords(){
+  const j = await api('/api/rolling');
+  if(!j.records.length){recordsBox.textContent='暂无记录';return}
+  let h = '<table><tr><th>#</th><th>航班</th><th>动作</th><th>状态</th><th>冲突数</th><th>创建</th><th>确认</th></tr>';
+  for(const r of j.records)
+    h += `<tr><td>${r.id}</td><td>${r.result.adjustment.flight_no}</td><td>${r.action}</td><td>${r.status==='confirmed'?'已确认':'待确认'}</td><td>${r.result.conflicts.length}</td><td>${r.created_by} ${fmt(r.created_at)}</td><td>${r.confirmed_by||''} ${fmt(r.confirmed_at)}</td></tr>`;
+  recordsBox.innerHTML = h + '</table>';
+}
+loadFlights().then(loadRecords).catch(e=>previewBox.textContent=e.message);
+</script>
