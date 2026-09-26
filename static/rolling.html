@@ -1,0 +1,120 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>滚动恢复调度台</title>
+<style>
+body{font:15px system-ui;max-width:1200px;margin:30px auto;background:#eef2f7;color:#182230;padding:0 20px}
+section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}
+input,button,select{font:inherit;padding:8px;margin:4px}
+button{background:#0f766e;color:white;border:0;border-radius:6px;cursor:pointer}
+button.ghost{background:#64748b}button:disabled{background:#94a3b8;cursor:not-allowed}
+table{border-collapse:collapse;width:100%;margin-top:10px;font-size:13px}
+th,td{border:1px solid #d7dee8;padding:6px 8px;text-align:left;vertical-align:top}
+th{background:#f1f5f9}.conflict{color:#b91c1c;font-weight:600}.ok{color:#15803d}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;color:white;background:#0f766e}
+.tag.cancel{background:#b91c1c}.tag.unchanged{background:#64748b}
+#msg{white-space:pre-wrap}
+a{color:#0f766e}
+</style>
+<h1>滚动恢复调度台</h1>
+<p><a href="/">← 返回状态总览</a>　调度员调整一趟航班后，系统沿同一架飞机的后续航段逐段顺延；已取消的航段保留取消并中断滚动链。逐段核对维护、执勤、宵禁和航线许可，确认后才写入执行方案，其他航班保持原样。</p>
+
+<section>
+  <b>身份</b><br>
+  用户 <input id="u" value="sched" style="width:90px">
+  角色 <select id="r"><option>scheduler</option><option>ops_manager</option><option>auditor</option><option>viewer</option></select>
+  <button class="ghost" onclick="loadFlights()">刷新航班</button>
+</section>
+
+<section>
+  <b>1. 调整首班</b><br>
+  触发航班 <select id="flights" style="width:320px"></select><br>
+  动作 <select id="action" onchange="toggleTimes()"><option value="shift">顺延 / 换机</option><option value="cancel">取消该航段</option></select>
+  新起飞(ISO) <input id="newStd" style="width:230px" placeholder="2026-10-01T09:00:00Z">
+  新落地(ISO) <input id="newSta" style="width:230px" placeholder="2026-10-01T11:00:00Z"><br>
+  换机(可选) <input id="aircraft" style="width:100px" placeholder="AC2">
+  换机组(可选) <input id="crew" style="width:100px" placeholder="CR2">
+  <button onclick="preview()">试算滚动（不写入）</button>
+</section>
+
+<section id="previewBox" style="display:none">
+  <b>2. 核对逐段结果</b>
+  <div id="verdict"></div>
+  <table><thead><tr><th>航班号</th><th>动作</th><th>原起飞</th><th>原落地</th><th>新起飞</th><th>新落地</th><th>延误(分)</th><th>约束核对</th></tr></thead>
+  <tbody id="legs"></tbody></table>
+</section>
+
+<section id="confirmBox" style="display:none">
+  <b>3. 写入执行方案</b><br>
+  新方案需中断事件 <input id="disruptionId" style="width:90px" placeholder="1">
+  方案名 <input id="planName" style="width:200px" value="滚动恢复调整">
+  或追加到已有草案 <input id="planId" style="width:90px" placeholder="plan_id">
+  expected_revision(可选) <input id="revision" style="width:80px"><br>
+  <button id="confirmBtn" onclick="confirmRoll()">确认写入</button>
+  <span class="conflict">存在约束冲突时不能确认写入；仅勾选到的航段会进方案，其他航班保持原样。</span>
+</section>
+
+<section>
+  <b>调整记录</b> <button class="ghost" onclick="loadRecords()">刷新记录</button>
+  <div id="msg"></div>
+  <table style="margin-top:8px"><thead><tr><th>#</th><th>方案</th><th>触发航班</th><th>动作</th><th>顺延(分)</th><th>顺延/取消航段</th><th>操作人</th><th>时间</th></tr></thead>
+  <tbody id="records"></tbody></table>
+</section>
+
+<script>
+let lastBody=null, lastResult=null;
+function headers(){return {'X-User-Id':u.value,'X-Role':r.value,'Content-Type':'application/json'}}
+async function api(method,url,body){
+  let x=await fetch(url,{method,headers:headers(),body:body?JSON.stringify(body):undefined});
+  let data=await x.json().catch(()=>({}));
+  if(!x.ok) throw Object.assign(new Error(data.message||('HTTP '+x.status)),{data});
+  return data;
+}
+function toggleTimes(){let cancel=action.value==='cancel';newStd.disabled=newSta.disabled=cancel}
+async function loadFlights(){
+  let s=await api('GET','/api/state');
+  flights.innerHTML=s.flights.map(f=>`<option value="${f.id}">${f.flight_no} ${f.origin}->${f.destination} ${f.std} [${f.aircraft_id}] ${f.status==='canceled'?'(已取消)':''}</option>`).join('');
+}
+function tag(a){return a==='cancel'?'<span class="tag cancel">保留取消</span>':a==='unchanged'?'<span class="tag unchanged">不变</span>':'<span class="tag">顺延</span>'}
+async function preview(){
+  msg.textContent='';
+  let body={flight_id:parseInt(flights.value),action:action.value};
+  if(body.action==='shift'){body.new_std=newStd.value.trim();body.new_sta=newSta.value.trim()}
+  if(aircraft.value.trim())body.aircraft_id=aircraft.value.trim();
+  if(crew.value.trim())body.crew_id=crew.value.trim();
+  lastBody=body;
+  try{
+    let r=await api('POST','/api/rolling/preview',body);lastResult=r;
+    previewBox.style.display='block';
+    verdict.innerHTML=r.feasible
+      ? '<p class="ok">✓ 全部航段通过维护、执勤、宵禁、航线许可与机位衔接核对，可以确认写入。</p>'
+      : `<p class="conflict">✗ 共 ${r.conflicts.length} 处约束冲突（写清航班号与约束），解决后才能确认写入。累计顺延 ${r.summary.total_delay_minutes} 分钟。</p>`;
+    legs.innerHTML=r.legs.map(l=>`<tr>
+      <td>${l.flight_no}<br><small>${l.origin}->${l.destination}</small></td><td>${tag(l.action)}</td>
+      <td>${l.old_std}</td><td>${l.old_sta}</td>
+      <td>${l.new_std||'—'}</td><td>${l.new_sta||'—'}</td><td>${l.delay_minutes}</td>
+      <td>${l.conflicts.length?l.conflicts.map(c=>`<div class="conflict">[${c.constraint}] ${c.message}</div>`).join(''):'<span class="ok">通过</span>'}
+          ${l.reason?`<br><small>${l.reason}</small>`:''}</td></tr>`).join('');
+    confirmBox.style.display=r.feasible?'block':'none';
+  }catch(e){previewBox.style.display='none';confirmBox.style.display='none';msg.textContent='试算失败: '+e.message+(e.data&&e.data.details?('\n'+JSON.stringify(e.data.details,null,2)):'')}
+}
+async function confirmRoll(){
+  if(!lastBody)return;
+  confirmBtn.disabled=true;
+  try{
+    let body=Object.assign({},lastBody);
+    if(planId.value.trim()){body.plan_id=parseInt(planId.value);if(revision.value.trim())body.expected_revision=parseInt(revision.value)}
+    else{body.disruption_id=parseInt(disruptionId.value);body.name=planName.value}
+    let r=await api('POST','/api/rolling/confirm',body);
+    msg.innerHTML=`<span class="ok">已写入方案 #${r.plan.id}（${r.created_plan?'新建':'追加'}），调整记录 #${r.record.id}。请在方案校验/锁定流程中复核。</span>`;
+    await loadRecords();await loadFlights();
+  }catch(e){msg.textContent='确认失败，未写入: '+e.message+(e.data&&e.data.details?('\n'+JSON.stringify(e.data.details,null,2)):'')}
+  finally{confirmBtn.disabled=false}
+}
+async function loadRecords(){
+  try{
+    let r=await api('GET','/api/rolling-records');
+    records.innerHTML=r.records.map(x=>`<tr><td>${x.id}</td><td>${x.plan_id||'—'}</td><td>${x.trigger_flight_no}</td>
+      <td>${x.action}</td><td>${x.shift_minutes}</td><td>${x.shifted_count} / ${x.canceled_count}</td>
+      <td>${x.created_by}</td><td>${x.created_at}</td></tr>`).join('')||'<tr><td colspan="8">暂无调整记录</td></tr>';
+  }catch(e){msg.textContent='记录加载失败: '+e.message}
+}
+toggleTimes();loadFlights();loadRecords();
+</script>

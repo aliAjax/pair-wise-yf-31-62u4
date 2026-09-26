@@ -21,7 +21,16 @@ python3 app.py --db airline_recovery.db
 - `POST /api/plans/{id}/validate`、`/lock`：校验并原子锁定方案。
 - `GET /api/disruptions/{id}/compare`：比较恢复方案成本。
 - `POST /api/flights/{id}/cancel`、`/recover`：取消和人工恢复。
+- `POST /api/rolling/preview`、`/api/rolling/confirm`：换机/延误后沿同一架飞机后续航段滚动顺延或保留取消，逐段核对维护、执勤、宵禁、航线许可与机位衔接；冲突写清航班号和约束，确认无冲突后才写入执行方案。
+- `GET /api/rolling-records`：滚动调整记录（可带 `?plan_id=`）。
+- 调度台页面：首页 `/` 与滚动恢复页 `/rolling`。
 - `GET /api/state`、`GET /api/plans/{id}`：查询状态和影响。
+
+## 滚动恢复的三个业务文件
+
+- `rolling.py`：纯滚动计算。给定航班/资源快照与首班调整，按同一架飞机后续航段时间顺序逐段顺延；前一班未落地则后班不得沿用原起飞时刻；已取消航段保留取消并中断滚动链。逐段核对维护到期、机组执勤、起降宵禁、航线许可和机位衔接，冲突均带航班号、约束类型与中文说明；不做任何写入。
+- `adjustments.py`：调整记录业务服务。提供试算（preview，不写入）与确认（confirm，事务内重算，有冲突整体回滚；仅受影响航段写入方案，其他航班保持原样），并在 `rolling_adjustments` 表与审计日志留痕，支持追加到草案（乐观版本号）和调整记录查询。
+- `static/rolling.html`：页面入口（`/rolling`），选择触发航班、试算逐段核对结果、确认写入并查看调整记录；首页 `/` 提供链接。
 
 ## 测试
 

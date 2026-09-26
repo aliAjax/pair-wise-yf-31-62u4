@@ -7,45 +7,17 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, time, timezone
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from adjustments import RollingAdjustmentService, ensure_rolling_tables
+from rolling import ApiError, iso, parse_clock, parse_time, utcnow
+
 PORT = 8202
 ROLES = {"viewer", "scheduler", "ops_manager", "auditor"}
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str, details: Any = None):
-        super().__init__(message)
-        self.status, self.code, self.message, self.details = status, code, message, details
-
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def iso(value: datetime | None = None) -> str:
-    return (value or utcnow()).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def parse_time(value: str | None) -> datetime:
-    if not value:
-        raise ApiError(400, "time_required", "必须提供 ISO 8601 时间")
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ApiError(400, "invalid_time", f"时间格式错误: {value}") from exc
-    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
-
-
-def parse_clock(value: str) -> time:
-    try:
-        return time.fromisoformat(value)
-    except ValueError as exc:
-        raise ApiError(400, "invalid_clock", f"时刻格式应为 HH:MM: {value}") from exc
 
 
 def overlaps(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
@@ -67,7 +39,10 @@ class Repository:
             yield self.conn
             self.conn.execute("COMMIT")
         except Exception:
-            self.conn.execute("ROLLBACK")
+            # sqlite3 may have rolled back automatically when the connection
+            # saw the error; a second ROLLBACK must not mask the original one.
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
             raise
 
     def _init(self) -> None:
@@ -98,6 +73,7 @@ class Repository:
             CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
             """
         )
+        ensure_rolling_tables(self.conn)
 
     @staticmethod
     def audit(conn: sqlite3.Connection, plan_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -105,7 +81,7 @@ class Repository:
                      (plan_id, actor, role, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), iso()))
 
 
-class AirlineRecoveryService:
+class AirlineRecoveryService(RollingAdjustmentService):
     def __init__(self, db_path: str | Path):
         self.repo = Repository(db_path)
 
@@ -349,6 +325,11 @@ class AirlineRecoveryService:
                 conn.execute("UPDATE flights SET std=?,sta=?,aircraft_id=?,crew_id=?,delay_minutes=?,revision=revision+1,updated_at=? WHERE id=?",
                              (row["new_std"], row["new_sta"], row["aircraft_id"], row["crew_id"], max(0, row["delay_minutes"]), iso(), row["flight_id"]))
                 conn.execute("UPDATE assignments SET status='active' WHERE id=?", (row["id"],))
+            for row in conn.execute("""SELECT a.*,f.flight_no FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=? AND a.status='canceled'""", (plan_id,)):
+                # Kept cancellations pushed by the rolling chain.
+                conn.execute("UPDATE flights SET status='canceled',cancel_reason=COALESCE(cancel_reason,?),revision=revision+1,updated_at=? WHERE id=? AND status!='canceled'",
+                             ("滚动恢复方案保留取消", iso(), row["flight_id"]))
+                conn.execute("UPDATE assignments SET status='active' WHERE id=?", (row["id"],))
             Repository.audit(conn, plan_id, actor, role, "plan_locked", {"metrics": metrics})
             return self.get_plan(plan_id)
 
@@ -433,6 +414,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health": return 200, {"status": "ok", "service": "airline-recovery"}
         actor, role = self.service.identity(self.headers)
         if path == "/api/state": return 200, self.service.state()
+        if path == "/api/rolling-records":
+            plan_id = parse_qs(urlparse(self.path).query).get("plan_id", [None])[0]
+            return 200, self.service.list_rolling_records(actor, role, int(plan_id) if plan_id and plan_id.isdigit() else None)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["api", "disruptions"] and parts[2].isdigit() and parts[3] == "compare": return 200, self.service.compare_plans(int(parts[2]))
@@ -447,6 +431,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/flights": lambda: (201, self.service.create_flight(actor, role, body)),
             "/api/disruptions": lambda: (201, self.service.create_disruption(actor, role, body)),
             "/api/recovery-plans": lambda: (201, self.service.create_plan(actor, role, body)),
+            "/api/rolling/preview": lambda: (200, self.service.preview_rolling(actor, role, body)),
+            "/api/rolling/confirm": lambda: (200, self.service.confirm_rolling(actor, role, body)),
         }
         if path in table: return table[path]()
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit():
@@ -464,6 +450,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if method == "GET" and parsed.path == "/":
                 raw = (self.web_root / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+            if method == "GET" and parsed.path == "/rolling":
+                raw = (self.web_root / "rolling.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
             status, payload = self.get_api(parsed.path) if method == "GET" else self.post_api(parsed.path)
             respond(self, status, payload)
         except ApiError as exc:
